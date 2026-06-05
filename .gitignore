@@ -1,0 +1,12 @@
+
+*.gguf
+*.bin
+*.tar.gz
+
+# Block compiled third-party dependencies
+llama.cpp/
+
+# Block local Python environments
+venv/
+__pycache__/
+.DS_Store
