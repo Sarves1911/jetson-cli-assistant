@@ -1,99 +1,123 @@
-# Jetson Orin Nano Edge AI CLI Assistant
+# Jetson Orin Nano — Edge LLM Inference Microservice
 
-This repository contains the architecture, automation scripts, and client utilities to deploy a hardware-accelerated, fine-tuned LLM microservice natively on an NVIDIA Jetson Orin Nano. 
+QLoRA fine-tuned TinyLlama-1.1B, quantized to 4-bit GGUF, and served as a CUDA-accelerated OpenAI-compatible REST API on an NVIDIA Jetson Orin Nano. The Jetson operates as a fully self-contained inference node — no cloud dependency, no internet required at runtime.
 
-Using `llama.cpp` compiled with CUDA support, the system exposes an OpenAI-compatible REST API over a local Mac-to-Jetson USB-C network link, serving token inference at optimized speeds.
+The host machine connects over a virtual Ethernet link via USB-C (`192.168.55.1`) and queries the model through a local HTTP endpoint.
+
+---
 
 ## System Architecture
 
-* **Model:** Fine-tuned TinyLlama (1.1B parameters, 4-bit GGUF quantization)
-* **Edge Hardware:** NVIDIA Jetson Orin Nano (Ampere Architecture, Unified Memory)
-* **Host Machine:** macOS / Linux Client
-* **Interconnect:** Virtual Ethernet over USB-C data link (`192.168.55.1`)
-* **Inference Engine:** `llama.cpp` (CUDA-accelerated)
+| Component | Detail |
+|---|---|
+| Base Model | TinyLlama-1.1B-Chat-v1.0 |
+| Fine-Tuning | QLoRA (r=16, alpha=32) on CodeAlpaca-20k (1k examples), 3 epochs, T4 GPU |
+| Quantization | GGUF Q4_K_M — ~700MB on disk |
+| Edge Hardware | NVIDIA Jetson Orin Nano 8GB (Ampere SM8.7, unified LPDDR5 memory) |
+| Inference Engine | `llama.cpp` compiled natively with `LLAMA_CUDA=1` |
+| API | OpenAI-compatible `/v1/completions` REST endpoint |
+| Interconnect | Virtual Ethernet over USB-C (`192.168.55.1`) |
+| Client | macOS / Linux host |
 
 ---
 
 ## Repository Structure
 
 ```text
-jetson-edge-cli-assistant/
-├── .gitignore                  # Prevents tracking large model weights and build files
-├── README.md                   # Comprehensive documentation and guide
+jetson-cli-assistant/
 ├── notebooks/
-│   └── tinyllama_finetuning.ipynb # Training notebook for the command-line dataset
+│   └── tinyllama_finetuning.ipynb  # QLoRA training: dataset prep → LoRA attach → SFT → adapter export
 ├── scripts/
-│   ├── setup_jetson.sh         # Automates native compilation with CUDA on edge hardware
-│   └── start_server.sh         # Disables display manager to reclaim RAM and starts API
-└── client/
-    ├── test_api.py             # Python client utility to query the microservice
-    └── test_api.sh             # Lightweight cURL/Bash verification script
+│   ├── setup_jetson.sh             # Extracts llama.cpp bundle, compiles with CUDA on-device
+│   └── start_server.sh             # Stops gdm3 (~1GB VRAM reclaim), launches llama-server
+├── client/
+│   ├── test_api.py                 # Python client — POST to /v1/completions, stream response
+│   └── test_api.sh                 # cURL equivalent for rapid endpoint verification
+└── images/
+    ├── server_logs.jpg             # llama.cpp server init output on Jetson
+    └── api_response.jpg            # JSON response received on host Mac
 ```
+
+---
+
+## Training Pipeline (Google Colab, T4)
+
+**Dataset:** `sahil2801/CodeAlpaca-20k`, first 1,000 examples — instruction/response pairs formatted to Alpaca prompt template.
+
+**Fine-tuning stack:**
+- `transformers` + `peft` + `trl` (SFTTrainer + SFTConfig)
+- 4-bit NF4 quantization via `bitsandbytes` for base model load (`bnb_4bit_quant_type=nf4`, `compute_dtype=float16`)
+- LoRA adapters on `q_proj`, `k_proj`, `v_proj`, `o_proj` — 4.5M trainable params out of 1.1B (0.41%)
+- Optimizer: `paged_adamw_8bit`, cosine LR decay, `lr=2e-4`, effective batch size 16 (4 × grad accum 4)
+- Training time: ~7 minutes / 189 steps / 3 epochs
+
+**Loss curve:** 1.26 → 0.66 (converged, no divergence)
+
+**Output:** `adapter_model.safetensors` — merged with base weights post-training, then converted to GGUF Q4_K_M via `llama.cpp/convert_hf_to_gguf.py` + `llama-quantize`.
 
 ---
 
 ## Deployment Guide
 
-### Phase 1: Preparation (On the Host Machine)
-Because the Jetson operates on a private network via the USB-C link, download the inference engine source code on your internet-connected host machine first.
+### Phase 1 — Host Machine Preparation
 
-1. Clone this repository onto your host laptop.
-2. Download the dependencies and bundle them:
-   ```bash
-   git clone [https://github.com/ggerganov/llama.cpp](https://github.com/ggerganov/llama.cpp)
-   tar -czvf llama_cpp.tar.gz llama.cpp/
-   ```
-3. Transfer the bundled engine and your fine-tuned `.gguf` model file over the USB-C link to the Jetson:
-   ```bash
-   scp llama_cpp.tar.gz sjsujetson@192.168.55.1:~/
-   scp path/to/your/tinyllama-linux-cli-Q4_K_M.gguf sjsujetson@192.168.55.1:~/
-   ```
+The Jetson has no direct internet access at runtime. Pre-bundle all dependencies on the host.
 
-### Phase 2: Compilation & Execution (On the Jetson)
-1. SSH into your Jetson Orin Nano:
-   ```bash
-   ssh sjsujetson@192.168.55.1
-   ```
-2. Run the automated environment setup script. This script will extract your source code bundle and compile `llama.cpp` natively with full CUDA hardware acceleration enabled:
-   ```bash
-   chmod +x scripts/setup_jetson.sh
-   ./scripts/setup_jetson.sh
-   ```
-3. Launch the hardware-optimized microservice. This automatically handles turning off the Ubuntu Display Manager (`gdm3`) to recover ~1GB of VRAM for inference:
-   ```bash
-   chmod +x scripts/start_server.sh
-   ./scripts/start_server.sh
-   ```
+```bash
+# Clone this repo and the inference engine
+git clone https://github.com/Sarves1911/jetson-cli-assistant
+git clone https://github.com/ggerganov/llama.cpp
+tar -czvf llama_cpp.tar.gz llama.cpp/
 
-### Phase 3: Testing the API (From the Host Machine)
-Open a separate terminal tab or window on your host machine and navigate to the project directory.
+# Transfer bundle + GGUF model over USB-C link
+scp llama_cpp.tar.gz sjsujetson@192.168.55.1:~/
+scp tinyllama-linux-cli-Q4_K_M.gguf sjsujetson@192.168.55.1:~/
+```
 
-* **Option A: Python Client**
-  Install requirements and run the tester script:
-  ```bash
-  pip install requests
-  python client/test_api.py
-  ```
+### Phase 2 — On-Device Compilation (Jetson Orin Nano)
 
-* **Option B: Bash Client**
-  Execute the rapid shell execution script:
-  ```bash
-  chmod +x client/test_api.sh
-  ./client/test_api.sh
-  ```
+```bash
+ssh sjsujetson@192.168.55.1
+
+# Compile llama.cpp with CUDA backend — targets Ampere (SM8.7)
+chmod +x scripts/setup_jetson.sh && ./scripts/setup_jetson.sh
+
+# Kill display manager to reclaim ~1GB unified memory, then start server
+chmod +x scripts/start_server.sh && ./scripts/start_server.sh
+```
+
+`start_server.sh` stops `gdm3`, sets `LLAMA_CUDA=1`, and launches `llama-server` with full GPU layer offload.
+
+### Phase 3 — Query the API (Host Machine)
+
+```bash
+# Python client
+pip install requests
+python client/test_api.py
+
+# Or raw cURL
+chmod +x client/test_api.sh && ./client/test_api.sh
+```
+
+The endpoint accepts standard OpenAI-format payloads at `http://192.168.55.1:8080/v1/completions`.
 
 ---
 
-## API Performance Benchmarks (Orin Nano)
-* **Prompt Processing (Prefill):** ~280+ tokens/sec (Fully offloaded to Ampere GPU)
-* **Token Generation (Decoding):** ~50+ tokens/sec
+## Inference Benchmarks (Jetson Orin Nano 8GB)
+
+| Metric | Value |
+|---|---|
+| Prompt Processing (prefill) | ~280 tokens/sec |
+| Token Generation (decode) | ~50 tokens/sec |
+| Model Size on Disk | ~700MB (Q4_K_M) |
+| GPU Layers Offloaded | Full (Ampere CUDA) |
 
 ### Verification
 
-Here is the microservice initializing and exposing the API endpoint natively on the Jetson Orin Nano:
+Microservice initializing on the Jetson:
 
 ![Jetson Server Initialization](images/server_logs.jpg)
 
-And the corresponding low-latency JSON response received on the host Mac:
+API response received on host Mac:
 
 ![Host Mac Client Request](images/api_response.jpg)
